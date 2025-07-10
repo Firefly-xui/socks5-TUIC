@@ -10,7 +10,10 @@
 
 -FinalShell下载地址 [FinalShell](https://dl.hostbuf.com/finalshell3/finalshell_windows_x64.exe)
 
-# TUIC中转搭建协议
+# socks5落地机搭建
+请自行搭建socks5协议，或者参考：[3X-UI](https://github.com/Firefly-xui/3x-ui)。
+
+# TUIC中转机搭建
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/Firefly-xui/socks5-TUIC/master/socks5-TUIC.sh)
 ```  
